@@ -8,18 +8,19 @@
 // Cooldown per model: 5 minutes, then retries
 
 const HEAVY_POOL = [
-  'google/gemma-4-31b-it:free',         // 31B — best quality
-  'google/gemma-4-26b-a4b-it:free',     // 26B MoE — fast & smart
-  'inclusionai/ling-3.0-flash-fin:free',// Good reasoning
+  'nvidia/llama-3.1-nemotron-70b-instruct:free', // Extremely smart, best free reasoning
+  'google/gemma-4-31b-it:free',         
+  'google/gemma-4-26b-a4b-it:free',     
+  'inclusionai/ling-3.0-flash-fin:free',
   'dots-studio/dots-3-note-preview:free',
-  'openrouter/free',                     // fallback: OR picks best available
+  'openrouter/free',                     
 ];
 
 const LIGHT_POOL = [
-  'liquid/lfm-2.5-2.6b:free',           // Ultra fast, tiny
-  'google/gemma-4-26b-a4b-it:free',     // Still free, still good
+  'liquid/lfm-2.5-2.6b:free',           
+  'google/gemma-4-26b-a4b-it:free',     
   'inclusionai/ling-3.0-flash-vl:free',
-  'openrouter/free',                     // last resort
+  'openrouter/free',                     
 ];
 
 // Rate-limit tracker: modelId → cooldown expiry timestamp
@@ -387,8 +388,16 @@ async function executeTool(name, args, sendCallback) {
       }
 
       case 'read_file': {
+        const ext = path.extname(args.file_path).toLowerCase();
+        if (ext === '.pdf') {
+          try {
+            const pdfParse = require('pdf-parse');
+            const data = await pdfParse(await fs.readFile(args.file_path));
+            return data.text.slice(0, 8000);
+          } catch(e) { return 'Error reading PDF: ' + e.message; }
+        }
         const content = await fs.readFile(args.file_path, 'utf8');
-        return content.slice(0, 3000);
+        return content.slice(0, 8000);
       }
 
       case 'delete_file': {
@@ -409,12 +418,17 @@ async function executeTool(name, args, sendCallback) {
       }
 
       case 'read_url': {
-        const res = await axios.get(args.url, {
-          headers: { 'User-Agent': 'Mozilla/5.0' },
-          timeout: 10000
-        });
-        const text = res.data.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 3000);
-        return text;
+        try {
+          const res = await axios.get(args.url, {
+            headers: { 'User-Agent': 'Mozilla/5.0' },
+            timeout: 10000
+          });
+          const cheerio = require('cheerio');
+          const $ = cheerio.load(res.data);
+          $('script, style, nav, footer, header').remove();
+          const text = $('body').text().replace(/\s+/g, ' ').trim().slice(0, 5000);
+          return text || 'No readable text found on this page.';
+        } catch(e) { return 'Error reading URL: ' + e.message; }
       }
 
       case 'schedule_task': {
@@ -510,7 +524,7 @@ async function runJiji(sessionId, userMessage, saveHistory = true, sendCallback 
       });
     } catch (err) {
       const status = err?.status || err?.response?.status;
-      const isQuota = status === 402 || status === 429 || status === 404
+      const isQuota = status === 402 || status === 429 || status === 404 || status === 400
                    || (err.message || '').includes('quota')
                    || (err.message || '').includes('rate limit')
                    || (err.message || '').includes('unavailable');
@@ -519,7 +533,7 @@ async function runJiji(sessionId, userMessage, saveHistory = true, sendCallback 
         markLimited(model);
         const next = pickModel(pool);
         if (next === model) throw err; // all limited, give up
-        console.log(`[model] switching to ${next}`);
+        console.log(`[model] switching to ${next} (error ${status})`);
         model = next;
         iteration--; // retry same iteration with new model
         continue;
