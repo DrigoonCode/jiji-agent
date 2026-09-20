@@ -71,7 +71,7 @@ function pickKey(keys) {
   return available[Math.floor(Math.random() * available.length)];
 }
 
-// Keywords that need heavy model
+// Keywords that need heavy model (including search/tool queries)
 const HEAVY_KEYWORDS = [
   'banao','bana','banana','create','build','make','generate','design',
   'develop','implement','setup','deploy','launch',
@@ -81,6 +81,7 @@ const HEAVY_KEYWORDS = [
   'fix','debug','refactor','optimize','html','css','javascript','react','node','python','java',
   'analyze','explain','compare','review','summarize','research','plan','suggest','improve',
   'file','folder','repo','github','push','commit',
+  'search','find','who is','what is','tell me about','give me info','details'
 ];
 
 function selectModel(userMessage) {
