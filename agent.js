@@ -89,6 +89,8 @@ const { Octokit } = require('@octokit/rest');
 const ai = new OpenAI({
   baseURL: 'https://openrouter.ai/api/v1',
   apiKey: process.env.OPENROUTER_KEY,
+  timeout: 60000,      // 60s timeout (prevents Premature close)
+  maxRetries: 2,       // auto-retry on network failures
 });
 
 const octokit = process.env.GITHUB_TOKEN
@@ -329,25 +331,47 @@ async function executeTool(name, args, sendCallback) {
     switch (name) {
 
       case 'web_search': {
-        if (!process.env.TAVILY_KEY) {
-          // Fallback: DuckDuckGo instant answers
-          const res = await axios.get(`https://api.duckduckgo.com/?q=${encodeURIComponent(args.query)}&format=json&no_html=1`);
-          const data = res.data;
-          const result = data.AbstractText || data.Answer || 'Koi result nahi mila. Tavily API key add karo better results ke liye.';
-          return result;
+        // Strategy: Brave Search API > DuckDuckGo HTML scrape > DDG instant
+        const braveKey = process.env.BRAVE_SEARCH_KEY;
+        if (braveKey && braveKey !== 'BSA_YAHAN_BRAVE_KEY_DAALO') {
+          try {
+            const res = await axios.get('https://api.search.brave.com/res/v1/web/search', {
+              params: { q: args.query, count: 5 },
+              headers: { 'X-Subscription-Token': braveKey },
+              timeout: 10000
+            });
+            const results = (res.data.web?.results || []).slice(0, 5)
+              .map(r => `**${r.title}**\n${(r.description || '').slice(0, 300)}\n${r.url}`)
+              .join('\n\n');
+            return results || 'No results found.';
+          } catch { /* fall through to DDG */ }
         }
-        const res = await axios.post('https://api.tavily.com/search', {
-          api_key: process.env.TAVILY_KEY,
-          query: args.query,
-          max_results: 5,
-          include_answer: true
-        });
-        const answer = res.data.answer ? `📋 **Summary:** ${res.data.answer}\n\n` : '';
-        const results = res.data.results
-          .slice(0, 3)
-          .map(r => `📌 **${r.title}**\n${r.content?.slice(0, 300)}\n🔗 ${r.url}`)
-          .join('\n\n');
-        return answer + results;
+
+        // DuckDuckGo HTML scrape (always free, no key needed)
+        try {
+          const res = await axios.get(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(args.query)}`, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+            timeout: 10000
+          });
+          const cheerio = require('cheerio');
+          const $ = cheerio.load(res.data);
+          const results = [];
+          $('.result').each((i, el) => {
+            if (i >= 5) return false;
+            const title = $(el).find('.result__title').text().trim();
+            const snippet = $(el).find('.result__snippet').text().trim();
+            const href = $(el).find('.result__url').text().trim();
+            if (title) results.push(`**${title}**\n${snippet}\n${href}`);
+          });
+          if (results.length) return results.join('\n\n');
+        } catch { /* fall through */ }
+
+        // Last resort: DDG instant answers
+        try {
+          const res = await axios.get(`https://api.duckduckgo.com/?q=${encodeURIComponent(args.query)}&format=json&no_html=1`, { timeout: 8000 });
+          const d = res.data;
+          return d.AbstractText || d.Answer || d.RelatedTopics?.slice(0,3).map(t => t.Text).join('\n') || 'Search mein kuch nahi mila.';
+        } catch { return 'Search failed. Check internet connection.'; }
       }
 
       case 'create_github_project': {
@@ -524,10 +548,14 @@ async function runJiji(sessionId, userMessage, saveHistory = true, sendCallback 
       });
     } catch (err) {
       const status = err?.status || err?.response?.status;
+      const errMsg = (err.message || '').toLowerCase();
       const isQuota = status === 402 || status === 429 || status === 404 || status === 400
-                   || (err.message || '').includes('quota')
-                   || (err.message || '').includes('rate limit')
-                   || (err.message || '').includes('unavailable');
+                   || errMsg.includes('quota')
+                   || errMsg.includes('rate limit')
+                   || errMsg.includes('unavailable')
+                   || errMsg.includes('premature close')
+                   || errMsg.includes('econnreset')
+                   || errMsg.includes('fetch');
 
       if (isQuota) {
         markLimited(model);
