@@ -200,8 +200,42 @@ async function main() {
       rl.prompt(); return;
     }
 
+    if (line.startsWith('/read ')) {
+      const filePath = line.replace('/read ', '').trim();
+      try {
+        const ext = require('path').extname(filePath).toLowerCase();
+        let content = '';
+        if (ext === '.pdf') {
+          const pdfParse = require('pdf-parse');
+          const data = await pdfParse(require('fs').readFileSync(filePath));
+          content = data.text.slice(0, 10000);
+        } else {
+          content = require('fs').readFileSync(filePath, 'utf8').slice(0, 10000);
+        }
+        global.termContext = content;
+        global.termContextName = filePath;
+        console.log(chalk.green(`\n  ✅ File loaded: ${filePath} (${content.length} chars)`));
+        console.log(chalk.dim(`  Ab instruction type karo ki is file ke sath kya karna hai.\n`));
+      } catch (e) {
+        console.log(chalk.red(`\n  ❌ Error loading file: ${e.message}\n`));
+      }
+      rl.prompt(); return;
+    }
+
+    if (line === '/clearcontext') {
+      global.termContext = null;
+      global.termContextName = null;
+      console.log(chalk.dim('\n  File context cleared.\n'));
+      rl.prompt(); return;
+    }
+
     // Strip wake word
-    const input = line.replace(/^(hey\s+)?jiji[,!]?\s*/i, '').trim() || line;
+    let input = line.replace(/^(hey\s+)?jiji[,!]?\s*/i, '').trim() || line;
+    
+    if (global.termContext) {
+      input = `[Loaded file: ${global.termContextName}]\n\n${global.termContext}\n\n---\nUser instruction: ${input}`;
+      // Do NOT clear context automatically, let user clear it via /clearcontext
+    }
 
     // Thinking spinner
     const stop = spinner('Thinking...');
