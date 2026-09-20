@@ -23,32 +23,52 @@ const LIGHT_POOL = [
   'openrouter/free',                     
 ];
 
-// Rate-limit tracker: modelId → cooldown expiry timestamp
-const rateLimited = {};
+// Rate-limit trackers
+const rateLimitedModels = {};
+const rateLimitedKeys = {};
 const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 
-function isAvailable(model) {
-  const exp = rateLimited[model];
+function isModelAvailable(model) {
+  const exp = rateLimitedModels[model];
   if (!exp) return true;
-  if (Date.now() > exp) { delete rateLimited[model]; return true; }
+  if (Date.now() > exp) { delete rateLimitedModels[model]; return true; }
   return false;
 }
 
-function markLimited(model) {
-  rateLimited[model] = Date.now() + COOLDOWN_MS;
+function markModelLimited(model) {
+  rateLimitedModels[model] = Date.now() + COOLDOWN_MS;
   const mins = Math.round(COOLDOWN_MS / 60000);
-  console.log(`[model] ${model} rate-limited — cooling down ${mins}m`);
+  console.log(`[model] ${model} error — cooling down ${mins}m`);
 }
 
 function pickModel(pool) {
-  const available = pool.filter(isAvailable);
+  const available = pool.filter(isModelAvailable);
   if (available.length === 0) {
-    // All limited — pick least recently limited
-    const leastRecent = pool.sort((a,b) => (rateLimited[a]||0) - (rateLimited[b]||0))[0];
-    console.log(`[model] All limited — forcing ${leastRecent}`);
+    const leastRecent = pool.sort((a,b) => (rateLimitedModels[a]||0) - (rateLimitedModels[b]||0))[0];
     return leastRecent;
   }
-  return available[0]; // first available = highest priority
+  return available[0];
+}
+
+function isKeyAvailable(key) {
+  const exp = rateLimitedKeys[key];
+  if (!exp) return true;
+  if (Date.now() > exp) { delete rateLimitedKeys[key]; return true; }
+  return false;
+}
+
+function markKeyLimited(key) {
+  rateLimitedKeys[key] = Date.now() + COOLDOWN_MS;
+  console.log(`[key] Key ending in ...${key.slice(-4)} rate-limited — cooling down`);
+}
+
+function pickKey(keys) {
+  const available = keys.filter(isKeyAvailable);
+  if (available.length === 0) {
+    return keys.sort((a,b) => (rateLimitedKeys[a]||0) - (rateLimitedKeys[b]||0))[0];
+  }
+  // Load balancing: pick random available key
+  return available[Math.floor(Math.random() * available.length)];
 }
 
 // Keywords that need heavy model
@@ -86,11 +106,23 @@ const path = require('path');
 const { exec } = require('child_process');
 const { Octokit } = require('@octokit/rest');
 
-const ai = new OpenAI({
-  baseURL: 'https://openrouter.ai/api/v1',
-  apiKey: process.env.OPENROUTER_KEY,
-  timeout: 60000,      // 60s timeout (prevents Premature close)
-  maxRetries: 2,       // auto-retry on network failures
+// Parse multiple keys
+const rawKeys = process.env.OPENROUTER_KEYS || process.env.OPENROUTER_KEY || '';
+const ACTIVE_KEYS = rawKeys.split(',').map(k => k.trim()).filter(k => k.length > 10);
+
+if (ACTIVE_KEYS.length === 0) {
+  console.error("❌ Koi OPENROUTER_KEYS nahi mili .env mein!");
+  process.exit(1);
+}
+
+const aiClients = {};
+ACTIVE_KEYS.forEach(key => {
+  aiClients[key] = new OpenAI({
+    baseURL: 'https://openrouter.ai/api/v1',
+    apiKey: key,
+    timeout: 60000,
+    maxRetries: 2,
+  });
 });
 
 const octokit = process.env.GITHUB_TOKEN
@@ -540,10 +572,15 @@ async function runJiji(sessionId, userMessage, saveHistory = true, sendCallback 
 
   let finalResponse = '...';
   let iteration = 0;
+  let modelFallbacks = 0;
+  let keyFallbacks = 0;
+  
+  let currentKey = pickKey(ACTIVE_KEYS);
 
   while (iteration < 6) {
     iteration++;
-    rlog(`iteration ${iteration} — ${model}`);
+    rlog(`iteration ${iteration} — ${model} (Key: ...${currentKey.slice(-4)})`);
+    const ai = aiClients[currentKey];
 
     let response;
     try {
@@ -557,23 +594,40 @@ async function runJiji(sessionId, userMessage, saveHistory = true, sendCallback 
     } catch (err) {
       const status = err?.status || err?.response?.status;
       const errMsg = (err.message || '').toLowerCase();
-      const isQuota = status === 402 || status === 429 || status === 404 || status === 400
-                   || errMsg.includes('quota')
-                   || errMsg.includes('rate limit')
-                   || errMsg.includes('unavailable')
-                   || errMsg.includes('premature close')
-                   || errMsg.includes('econnreset')
-                   || errMsg.includes('fetch');
+      
+      const isKeyLimit = status === 402 || status === 429 || errMsg.includes('quota') || errMsg.includes('rate limit') || errMsg.includes('credits');
+      const isModelError = status === 404 || status === 400 || errMsg.includes('unavailable') || errMsg.includes('premature close') || errMsg.includes('fetch');
 
-      if (isQuota) {
-        markLimited(model);
-        const next = pickModel(pool);
-        if (next === model) throw err; // all limited, give up
-        console.log(`[model] switching to ${next} (error ${status})`);
-        model = next;
-        iteration--; // retry same iteration with new model
+      if (isKeyLimit) {
+        markKeyLimited(currentKey);
+        keyFallbacks++;
+        
+        currentKey = pickKey(ACTIVE_KEYS);
+        
+        if (keyFallbacks >= ACTIVE_KEYS.length) {
+          throw new Error('Sare 5 accounts ki limit cross ho gayi hai. Thodi der baad try karo (5 mins).');
+        }
+        
+        console.log(`[system] Switching API Key to ...${currentKey.slice(-4)}`);
+        iteration--; // Retry same model with new key
         continue;
       }
+      
+      if (isModelError) {
+        markModelLimited(model);
+        const next = pickModel(pool);
+        
+        modelFallbacks++;
+        if (next === model || modelFallbacks > pool.length) {
+          throw new Error('Sare free models down hain abhi. Thodi der baad try karo.');
+        }
+        
+        console.log(`[model] switching to ${next} (error ${status})`);
+        model = next;
+        iteration--; // Retry with new model
+        continue;
+      }
+      
       throw err;
     }
 
