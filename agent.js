@@ -331,23 +331,31 @@ async function executeTool(name, args, sendCallback) {
     switch (name) {
 
       case 'web_search': {
-        // Strategy: Brave Search API > DuckDuckGo HTML scrape > DDG instant
-        const braveKey = process.env.BRAVE_SEARCH_KEY;
-        if (braveKey && braveKey !== 'BSA_YAHAN_BRAVE_KEY_DAALO') {
+        // ── SearXNG — open source, no key, aggregates Google+Bing+DDG ──
+        const SEARXNG_INSTANCES = [
+          'https://search.sapti.me',
+          'https://searx.be',
+          'https://search.bus-hit.me',
+          'https://priv.au',
+        ];
+
+        for (const instance of SEARXNG_INSTANCES) {
           try {
-            const res = await axios.get('https://api.search.brave.com/res/v1/web/search', {
-              params: { q: args.query, count: 5 },
-              headers: { 'X-Subscription-Token': braveKey },
-              timeout: 10000
+            const res = await axios.get(`${instance}/search`, {
+              params: { q: args.query, format: 'json', categories: 'general', language: 'en' },
+              headers: { 'User-Agent': 'Mozilla/5.0' },
+              timeout: 8000
             });
-            const results = (res.data.web?.results || []).slice(0, 5)
-              .map(r => `**${r.title}**\n${(r.description || '').slice(0, 300)}\n${r.url}`)
-              .join('\n\n');
-            return results || 'No results found.';
-          } catch { /* fall through to DDG */ }
+            const items = (res.data.results || []).slice(0, 5);
+            if (items.length) {
+              return items.map(r =>
+                `**${r.title}**\n${(r.content || '').slice(0, 300)}\n${r.url}`
+              ).join('\n\n');
+            }
+          } catch { continue; } // try next instance
         }
 
-        // DuckDuckGo HTML scrape (always free, no key needed)
+        // ── Fallback: DuckDuckGo HTML scrape ──
         try {
           const res = await axios.get(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(args.query)}`, {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
@@ -366,12 +374,12 @@ async function executeTool(name, args, sendCallback) {
           if (results.length) return results.join('\n\n');
         } catch { /* fall through */ }
 
-        // Last resort: DDG instant answers
+        // ── Last resort: DDG instant ──
         try {
           const res = await axios.get(`https://api.duckduckgo.com/?q=${encodeURIComponent(args.query)}&format=json&no_html=1`, { timeout: 8000 });
           const d = res.data;
           return d.AbstractText || d.Answer || d.RelatedTopics?.slice(0,3).map(t => t.Text).join('\n') || 'Search mein kuch nahi mila.';
-        } catch { return 'Search failed. Check internet connection.'; }
+        } catch { return 'Search failed. Internet check karo.'; }
       }
 
       case 'create_github_project': {
